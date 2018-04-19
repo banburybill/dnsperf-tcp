@@ -83,8 +83,7 @@
 #include <isc/sockaddr.h>
 #include <isc/types.h>
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <gnutls/gnutls.h>
 
 #include <dns/rcode.h>
 #include <dns/result.h>
@@ -194,8 +193,10 @@ typedef struct
 	socket_recv_state_t recv_state;
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
+	unsigned char receiving_buffer[MAX_EDNS_PACKET];
+	int received_data_len;
 	unsigned int tcp_to_read;
-	SSL *ssl;
+	gnutls_session_t gnutls_session;
 	isc_uint64_t con_start_time;
 	isc_uint64_t tcp_hs_done_time;
 	isc_uint64_t tls_hs_done_time;
@@ -265,7 +266,7 @@ static isc_mem_t *mctx;
 
 static perf_datafile_t *input;
 
-static SSL_CTX *ctx;
+static gnutls_certificate_credentials_t gnutls_credentials;
 
 static void
 handle_sigint(int sig)
@@ -684,18 +685,18 @@ static int send_msg(threadinfo_t *tinfo, sockinfo_t *s, isc_buffer_t *msg)
 	assert(s->send_state == SOCKET_SEND_SENDING ||
 	       s->send_state == SOCKET_SEND_READY);
 	
-	int error = 0, res, ssl_err;
+	int error = 0, res;
 	unsigned int length = isc_buffer_usedlength(msg);
 	if (tinfo->config->usetcptls) {
 		LOCK(&tinfo->lock);
-		res = SSL_write(s->ssl, isc_buffer_base(msg), length);
-		ssl_err = SSL_get_error(s->ssl, res);
+		res = gnutls_record_send(s->gnutls_session, isc_buffer_base(msg), length);
 		UNLOCK(&tinfo->lock);
 		if (res <= 0) {
-			if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+			if (res == GNUTLS_E_INTERRUPTED ||
+			    res == GNUTLS_E_AGAIN)
 				error = EAGAIN;
 			else
-				error = ssl_err;
+				error = res;
 		}
 	} else {
 		res = sendto(s->fd,
@@ -784,16 +785,9 @@ find_sending_tcp_connection(int *socknum, threadinfo_t *tinfo)
 		}
 		if (sock->send_state == SOCKET_SEND_TLS_HANDSHAKE) {
 			LOCK(&tinfo->lock);
-			int res = SSL_connect(sock->ssl);
-			error = SSL_get_error(sock->ssl, res);
+			int res = gnutls_handshake(sock->gnutls_session);
 			UNLOCK(&tinfo->lock);
-			switch(res) {
-			case 0:
-				/* TODO: Need to reset the connection again */
-				perf_log_fatal("SSL_connect failed (controlled fail): %d", error);
-				break;
-
-			case 1:
+			if (res == GNUTLS_E_SUCCESS) {
 				LOCK(&tinfo->lock);
 				sock->send_state = SOCKET_SEND_READY;
 				sock->recv_state = SOCKET_RECV_READY;
@@ -803,15 +797,11 @@ find_sending_tcp_connection(int *socknum, threadinfo_t *tinfo)
 					isc_uint64_t now = get_time();
 					perf_log_printf("[DEBUG] TLS HS done on sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
 				}
-				break;
-
-			default:
-				if (error == SSL_ERROR_WANT_READ ||
-				    error == SSL_ERROR_WANT_WRITE)
-					continue;
-				perf_log_fatal("SSL_connect fail (fatal, not clean): %d", error);
-				break;
-			}
+			} else if (res == GNUTLS_E_INTERRUPTED ||
+				   res == GNUTLS_E_AGAIN)
+				continue;
+			else
+				perf_log_fatal("TLS Handshake failed : %s", gnutls_strerror(res));
 		}
 		return ISC_TRUE;
 	}
@@ -1015,12 +1005,12 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 int count_pending(threadinfo_t *tinfo, sockinfo_t *s)
 {
 	if (tinfo->config->usetcptls) {
-		int res;
 		LOCK(&tinfo->lock);
-		SSL_read(s->ssl, NULL, 0);
-		res = SSL_pending(s->ssl);
+		int res = gnutls_record_recv(s->gnutls_session, s->receiving_buffer + s->received_data_len, sizeof(s->receiving_buffer) - s->received_data_len);
 		UNLOCK(&tinfo->lock);
-		return res;
+		if (res > 0)
+			s->received_data_len += res;
+		return s->received_data_len;
 	} else {
 		int avbytes = 0;
 		if (ioctl(s->fd, FIONREAD, &avbytes) == -1)
@@ -1031,22 +1021,18 @@ int count_pending(threadinfo_t *tinfo, sockinfo_t *s)
 
 int recv_buf(threadinfo_t *tinfo, sockinfo_t *s, unsigned char *buf, unsigned int buflen)
 {
-	int bytes_read, error;
+	int bytes_read;
 	if (tinfo->config->usetcptls) {
-		LOCK(&tinfo->lock);
-		bytes_read = SSL_read(s->ssl, buf, buflen);
-		error = SSL_get_error(s->ssl, bytes_read);
-		UNLOCK(&tinfo->lock);
-		if (bytes_read <= 0)
-			return error;
-		else
-			return bytes_read;
+		if (buflen <= s->received_data_len) {
+			memcpy(buf, s->receiving_buffer, buflen);
+			memmove(s->receiving_buffer, s->receiving_buffer + buflen, s->received_data_len - buflen);
+			s->received_data_len -= buflen;
+			return buflen;
+		} else
+			return -1;
 	} else {
 		bytes_read = recv(s->fd, buf, buflen, 0);
-		if (bytes_read == -1)
-			return errno;
-		else
-			return bytes_read;
+		return bytes_read;
 	}
 }
 
@@ -1176,10 +1162,10 @@ close_socket(threadinfo_t *tinfo, sockinfo_t *sock)
 		perf_log_printf("[DEBUG] Shutting down sock %d in thread %p at %" PRIu64 "(usec)", sock->socket_number, tinfo, now);
 	}
 	LOCK(&tinfo->lock);
-	if (sock->ssl != NULL) {
-		SSL_shutdown(sock->ssl);
-		SSL_free(sock->ssl);
-		sock->ssl = NULL;
+	if (sock->gnutls_session != NULL) {
+		gnutls_bye(sock->gnutls_session, GNUTLS_SHUT_WR);
+		gnutls_deinit(sock->gnutls_session);
+		sock->gnutls_session = NULL;
 	}
 	close(sock->fd);
 	sock->fd = -1;
@@ -1218,6 +1204,7 @@ open_socket(threadinfo_t *tinfo, sockinfo_t *sock, isc_boolean_t reopen)
 		sock->num_sent = 0;
 		sock->num_recv = 0;
 		isc_buffer_init(&sock->sending, sock->sending_buffer, sizeof(sock->sending_buffer));
+		sock->received_data_len = 0;
 		sock->tcp_hs_done_time = 0;
 		sock->tls_hs_done_time = 0;
 		sock->con_start_time = get_time();
@@ -1226,11 +1213,20 @@ open_socket(threadinfo_t *tinfo, sockinfo_t *sock, isc_boolean_t reopen)
 	if (fd != -1 ) {
 		if (tinfo->config->usetcp) {
 			if (tinfo->config->usetcptls) {
-				sock->ssl = SSL_new(ctx);
-				if (sock->ssl == NULL)
-					perf_log_fatal("creating SSL object: %s",
-						       ERR_reason_error_string(ERR_get_error()));
-				SSL_set_fd(sock->ssl, fd);
+				int ret = gnutls_init(&sock->gnutls_session,  GNUTLS_CLIENT | GNUTLS_NONBLOCK);
+				if (ret != GNUTLS_E_SUCCESS)
+					perf_log_fatal("creating GNUTLS session: %s",
+						       gnutls_strerror(ret));
+				ret = gnutls_set_default_priority(sock->gnutls_session);
+				if (ret != GNUTLS_E_SUCCESS)
+					perf_log_fatal("setting default GNUTLS priority %s:",
+						       gnutls_strerror(ret));
+				ret = gnutls_credentials_set(sock->gnutls_session, GNUTLS_CRD_CERTIFICATE, gnutls_credentials);
+				if (ret != GNUTLS_E_SUCCESS)
+					perf_log_fatal("setting GNUTLS credentials %s:",
+						       gnutls_strerror(ret));
+				gnutls_handshake_set_timeout(sock->gnutls_session, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
+				gnutls_transport_set_int(sock->gnutls_session, fd);
 			}
 			sock->send_state = SOCKET_SEND_TCP_HANDSHAKE;
 			sock->recv_state = SOCKET_RECV_HANDSHAKE;
@@ -1599,23 +1595,20 @@ main(int argc, char **argv)
 	threadinfo_t stats_thread;
 	unsigned int i;
 	isc_result_t result;
-	const SSL_METHOD *method;
+	int ret;
 
 	printf("DNS Performance Testing Tool\n"
 	       "Nominum Version " VERSION "\n\n");
 
-	SSL_library_init();
-	OpenSSL_add_all_algorithms();
-	SSL_load_error_strings();
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-	method = SSLv23_client_method();
-#else
-	method = TLS_client_method();
-#endif
-	ctx = SSL_CTX_new(method);
-	if (ctx == NULL)
-		perf_log_fatal("creating SSL context: %s",
-			       ERR_reason_error_string(ERR_get_error()));
+	ret = gnutls_certificate_allocate_credentials(&gnutls_credentials);
+	if (ret < 0) {
+	    perf_log_fatal("GNUTLS failed to allocate credentials: %s", gnutls_strerror(ret));
+	}
+
+	ret = gnutls_certificate_set_x509_system_trust(gnutls_credentials);
+	if (ret < 0) {
+	    perf_log_fatal("GNUTLS failed to set system trust: %s", gnutls_strerror(ret));
+	}
 
 	setup(argc, argv, &config);
 
@@ -1682,6 +1675,8 @@ main(int argc, char **argv)
 
 	isc_mem_put(mctx, threads, config.threads * sizeof(threadinfo_t));
 	cleanup(&config);
+
+	gnutls_certificate_free_credentials(gnutls_credentials);
 
 	return (0);
 }
