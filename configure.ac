@@ -26,6 +26,9 @@ AC_SUBST(DNSLIBS, "`$ac_cv_isc_config --libs dns bind9`")
 AC_SUBST(DNSCFLAGS, "`$ac_cv_isc_config --cflags dns bind9`")
 
 AX_PTHREAD
+# OpenSSL needed by libbind.
+AX_CHECK_OPENSSL([], [AC_MSG_ERROR(["OpenSSL libraries not found"])])
+
 PKG_CHECK_MODULES(gnutls, gnutls >= 3.4)
 AC_SUBST(gnutls_LIBS)
 
