@@ -193,7 +193,7 @@ typedef struct
 	socket_recv_state_t recv_state;
 	isc_buffer_t sending;
 	unsigned char sending_buffer[MAX_EDNS_PACKET];
-	unsigned char receiving_buffer[MAX_EDNS_PACKET];
+	unsigned char receiving_buffer[MAX_INPUT_DATA];
 	int received_data_len;
 	unsigned int tcp_to_read;
 	gnutls_session_t gnutls_session;
@@ -1002,9 +1002,11 @@ process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
 	UNLOCK(&tinfo->lock);
 }
 
-int count_pending(threadinfo_t *tinfo, sockinfo_t *s)
+int count_pending(threadinfo_t *tinfo, sockinfo_t *s, int hint)
 {
 	if (tinfo->config->usetcptls) {
+		if (hint > 0 && s->received_data_len >= hint)
+			return s->received_data_len;
 		LOCK(&tinfo->lock);
 		int res = gnutls_record_recv(s->gnutls_session, s->receiving_buffer + s->received_data_len, sizeof(s->receiving_buffer) - s->received_data_len);
 		UNLOCK(&tinfo->lock);
@@ -1070,7 +1072,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 		bytes_read = recv(s->fd, packet_buffer, packet_size, 0);
 	} else {
 		if (s->recv_state != SOCKET_RECV_READING) {
-			pending = count_pending(tinfo, s);
+			pending = count_pending(tinfo, s, 2);
 			if (pending < 0) {
 				*saved_errnop = errno;
 				return ISC_FALSE;
@@ -1092,7 +1094,7 @@ recv_one(threadinfo_t *tinfo, int which_sock,
 			}
 		}
 		/* Now in SOCKET_RECV_READING */
-		pending = count_pending(tinfo, s);
+		pending = count_pending(tinfo, s, s->tcp_to_read);
 		if (pending < 0) {
 			*saved_errnop = errno;
 			return ISC_FALSE;
