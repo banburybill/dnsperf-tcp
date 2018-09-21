@@ -16,7 +16,7 @@
  */
 
 /*
- * Copyright (C) 2016 Sinodun IT Ltd.
+ * Copyright (C) 2016,2018 Sinodun IT Ltd.
  *
  * Permission to use, copy, modify, and distribute this software and its
  * documentation for any purpose with or without fee is hereby granted,
@@ -153,7 +153,7 @@ perf_os_waituntilanyreadable(int *fds, unsigned int nfds, int pipe_fd,
 	n = poll(read_fds, nfds + 1, timeout_msec);
 	if (n < 0) {
 		if (errno != EINTR)
-			perf_log_fatal("select() failed: Error was %s", strerror(errno));
+			perf_log_fatal("poll() failed: Error was %s", strerror(errno));
 		return (ISC_R_CANCELED);
 	} else if (n == 0) {
 		return (ISC_R_TIMEDOUT);
